@@ -349,6 +349,25 @@ impl App {
 
         self.frame_count += 1;
     }
+
+    fn resize_surface(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+
+        if let (Some(surface), Some(context)) = (&self.gl_surface, &self.gl_context) {
+            let w = NonZero::new(width).unwrap();
+            let h = NonZero::new(height).unwrap();
+            surface.resize(context, w, h);
+        }
+
+        if let Some(ref gl) = self.gl {
+            unsafe {
+                gl.viewport(0, 0, width as i32, height as i32);
+            }
+        }
+
+        self.window_size = [width as f32, height as f32];
+    }
 }
 
 impl ApplicationHandler for App {
@@ -449,7 +468,6 @@ impl ApplicationHandler for App {
         let u_mouse = unsafe { gl.get_uniform_location(program, "u_mouse") };
         let u_frame = unsafe { gl.get_uniform_location(program, "u_frame") };
 
-        self.window_size = [size.width as f32, size.height as f32];
         self.gl_config = Some(gl_config);
         self.gl_context = Some(gl_context);
         self.gl_surface = Some(surface);
@@ -461,6 +479,7 @@ impl ApplicationHandler for App {
         self.u_resolution = u_resolution;
         self.u_mouse = u_mouse;
         self.u_frame = u_frame;
+        self.resize_surface(size);
         self.start_time = Instant::now();
     }
 
@@ -481,16 +500,12 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
-                if let (Some(surface), Some(context)) = (&self.gl_surface, &self.gl_context) {
-                    let w = NonZero::new(size.width).unwrap_or(NonZero::new(1).unwrap());
-                    let h = NonZero::new(size.height).unwrap_or(NonZero::new(1).unwrap());
-                    surface.resize(context, w, h);
-                    if let Some(ref gl) = self.gl {
-                        unsafe {
-                            gl.viewport(0, 0, size.width as i32, size.height as i32);
-                        }
-                    }
-                    self.window_size = [size.width as f32, size.height as f32];
+                self.resize_surface(size);
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let size = self.window.as_ref().map(|window| window.inner_size());
+                if let Some(size) = size {
+                    self.resize_surface(size);
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
