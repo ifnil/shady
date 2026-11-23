@@ -66,13 +66,16 @@ void main() {
     vec3 view = world_pos - camera;
 
     float aspect = u_resolution.x / max(u_resolution.y, 1.0);
-    float inv_z = -1.0 / view.z;
 
+    // Perspective projection; w = -view.z does the divide, and z gives the
+    // depth test something to sort faces by.
+    const float NEAR = 0.1;
+    const float FAR = 10.0;
     gl_Position = vec4(
-        (view.x * inv_z) / aspect,
-        view.y * inv_z,
-        0.0,
-        1.0
+        view.x / aspect,
+        view.y,
+        (view.z * (FAR + NEAR) + 2.0 * FAR * NEAR) / (NEAR - FAR),
+        -view.z
     );
 
     v_world_pos = world_pos;

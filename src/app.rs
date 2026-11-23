@@ -1,6 +1,5 @@
 use std::num::NonZero;
-use std::path::PathBuf;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use glow::HasContext;
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
@@ -17,15 +16,15 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::Window;
 
-use crate::shader::{
-    DEFAULT_DRAW_VERTEX_COUNT, VERTEX_SHADER_SOURCE, assemble_fragment_shader,
-    assemble_vertex_shader, create_error_program, create_program, error_fragment_shader_source,
-    extract_draw_vertex_count,
-};
+use crate::files::ShaderFiles;
+use crate::shader::{DEFAULT_DRAW_VERTEX_COUNT, ShaderSet, create_error_program, create_program};
+use crate::uniforms::{FrameInputs, Uniforms};
+
+/// How often watch mode checks the shader files for changes.
+const WATCH_INTERVAL: Duration = Duration::from_millis(200);
 
 pub struct App {
     // GL plumbing
-    gl_config: Option<glutin::config::Config>,
     gl_context: Option<PossiblyCurrentContext>,
     gl_surface: Option<Surface<WindowSurface>>,
     window: Option<Window>,
@@ -34,12 +33,8 @@ pub struct App {
     gl: Option<glow::Context>,
     program: Option<glow::NativeProgram>,
     vao: Option<glow::NativeVertexArray>,
-
-    // Uniform locations
-    u_time: Option<glow::NativeUniformLocation>,
-    u_resolution: Option<glow::NativeUniformLocation>,
-    u_mouse: Option<glow::NativeUniformLocation>,
-    u_frame: Option<glow::NativeUniformLocation>,
+    uniforms: Uniforms,
+    draw_vertex_count: i32,
 
     // Runtime state
     start_time: Instant,
@@ -50,56 +45,37 @@ pub struct App {
     mouse_pressed: bool,
 
     // Shader state
-    fragment_source: String,
-    fragment_path: PathBuf,
-    vertex_source: String,
-    vertex_path: Option<PathBuf>,
+    files: ShaderFiles,
+    /// Shaders loaded at startup, compiled once the GL context exists.
+    pending_shaders: Option<ShaderSet>,
     watch_enabled: bool,
-    last_fragment_mtime: Option<SystemTime>,
-    last_vertex_mtime: Option<SystemTime>,
     last_watch_check: Instant,
-    draw_vertex_count: i32,
+    /// The last watch problem printed, so a lasting one is reported once.
+    last_watch_error: Option<String>,
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        fragment_source: String,
-        fragment_path: PathBuf,
-        vertex_source: String,
-        vertex_path: Option<PathBuf>,
-        watch_enabled: bool,
-        last_fragment_mtime: Option<SystemTime>,
-        last_vertex_mtime: Option<SystemTime>,
-        draw_vertex_count: i32,
-    ) -> Self {
+    pub fn new(files: ShaderFiles, shaders: ShaderSet, watch_enabled: bool) -> Self {
         Self {
-            gl_config: None,
             gl_context: None,
             gl_surface: None,
             window: None,
             gl: None,
             program: None,
             vao: None,
-            u_time: None,
-            u_resolution: None,
-            u_mouse: None,
-            u_frame: None,
+            uniforms: Uniforms::default(),
+            draw_vertex_count: DEFAULT_DRAW_VERTEX_COUNT,
             start_time: Instant::now(),
             frame_count: 0,
             mouse_pos: [0.0; 4],
             cursor_pos: [0.0; 2],
             window_size: [800.0, 600.0],
             mouse_pressed: false,
-            fragment_source,
-            fragment_path,
-            vertex_source,
-            vertex_path,
+            files,
+            pending_shaders: Some(shaders),
             watch_enabled,
-            last_fragment_mtime,
-            last_vertex_mtime,
             last_watch_check: Instant::now(),
-            draw_vertex_count,
+            last_watch_error: None,
         }
     }
 
@@ -107,245 +83,104 @@ impl App {
         event_loop.run_app(&mut self).expect("Event loop error");
     }
 
-    fn set_program(
-        &mut self,
-        program: glow::NativeProgram,
-        vertex_source: String,
-        fragment_source: String,
-        draw_vertex_count: i32,
-    ) {
-        let gl = self.gl.as_ref().unwrap();
+    /// Compiles `shaders` and switches to them, or to the built-in error
+    /// shader if they don't compile. Returns whether they compiled.
+    fn use_shaders(&mut self, shaders: ShaderSet) -> bool {
+        let gl = self
+            .gl
+            .as_ref()
+            .expect("GL is initialized before shaders are used");
+
+        let (program, draw_vertex_count, compiled) =
+            match create_program(gl, &shaders.vertex, &shaders.fragment) {
+                Ok(program) => (program, shaders.draw_vertex_count, true),
+                Err(err) => {
+                    eprintln!("{err}");
+                    eprintln!("Using built-in error shader until source compiles.");
+                    (create_error_program(gl), DEFAULT_DRAW_VERTEX_COUNT, false)
+                }
+            };
 
         if let Some(old_program) = self.program.replace(program) {
-            unsafe {
-                gl.delete_program(old_program);
-            }
+            unsafe { gl.delete_program(old_program) };
         }
-
-        self.u_time = unsafe { gl.get_uniform_location(program, "u_time") };
-        self.u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
-        self.u_mouse = unsafe { gl.get_uniform_location(program, "u_mouse") };
-        self.u_frame = unsafe { gl.get_uniform_location(program, "u_frame") };
-        self.vertex_source = vertex_source;
-        self.fragment_source = fragment_source;
+        self.uniforms = Uniforms::query(gl, program);
         self.draw_vertex_count = draw_vertex_count;
         self.frame_count = 0;
         self.start_time = Instant::now();
-    }
-
-    fn reload_program(
-        &mut self,
-        vertex_source: String,
-        fragment_source: String,
-        draw_vertex_count: i32,
-    ) -> bool {
-        let program_result = {
-            let gl = self.gl.as_ref().unwrap();
-            create_program(gl, &vertex_source, &fragment_source)
-        };
-
-        match program_result {
-            Ok(program) => {
-                self.set_program(program, vertex_source, fragment_source, draw_vertex_count);
-                true
-            }
-            Err(err) => {
-                eprintln!("{}", err);
-                eprintln!("Using built-in error shader until source compiles.");
-                let fallback_program = {
-                    let gl = self.gl.as_ref().unwrap();
-                    create_error_program(gl)
-                };
-                self.set_program(
-                    fallback_program,
-                    VERTEX_SHADER_SOURCE.to_owned(),
-                    error_fragment_shader_source().to_owned(),
-                    DEFAULT_DRAW_VERTEX_COUNT,
-                );
-                false
-            }
-        }
+        compiled
     }
 
     fn maybe_reload_shaders(&mut self) {
-        if !self.watch_enabled {
-            return;
-        }
-
-        // Avoid metadata checks every frame.
-        if self.last_watch_check.elapsed() < Duration::from_millis(200) {
+        if !self.watch_enabled
+            || self.gl.is_none()
+            || self.last_watch_check.elapsed() < WATCH_INTERVAL
+        {
             return;
         }
         self.last_watch_check = Instant::now();
 
-        let fragment_path = self.fragment_path.clone();
-        let vertex_path = self.vertex_path.clone();
+        let loaded = match self.files.changed() {
+            Ok(true) => self.files.load().map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(err),
+        };
 
-        let fragment_metadata = match std::fs::metadata(&fragment_path) {
-            Ok(metadata) => metadata,
+        let shaders = match loaded {
+            Ok(shaders) => {
+                self.last_watch_error = None;
+                shaders
+            }
             Err(err) => {
-                eprintln!(
-                    "Watch warning: failed to stat {}: {}",
-                    fragment_path.display(),
-                    err
-                );
+                // Editors that save by replacing the file can leave it missing
+                // for a moment, so don't repeat the same warning every check.
+                if self.last_watch_error.as_ref() != Some(&err) {
+                    eprintln!("Watch warning: {err}");
+                }
+                self.last_watch_error = Some(err);
                 return;
             }
         };
 
-        let fragment_modified = match fragment_metadata.modified() {
-            Ok(modified) => modified,
-            Err(err) => {
-                eprintln!(
-                    "Watch warning: failed to read mtime for {}: {}",
-                    fragment_path.display(),
-                    err
-                );
-                return;
-            }
-        };
-
-        let fragment_changed = self
-            .last_fragment_mtime
-            .is_none_or(|last| fragment_modified > last);
-
-        let mut vertex_modified: Option<SystemTime> = None;
-        let mut vertex_changed = false;
-
-        if let Some(path) = &vertex_path {
-            let metadata = match std::fs::metadata(path) {
-                Ok(metadata) => metadata,
-                Err(err) => {
-                    eprintln!("Watch warning: failed to stat {}: {}", path.display(), err);
-                    return;
-                }
-            };
-
-            let modified = match metadata.modified() {
-                Ok(modified) => modified,
-                Err(err) => {
-                    eprintln!(
-                        "Watch warning: failed to read mtime for {}: {}",
-                        path.display(),
-                        err
-                    );
-                    return;
-                }
-            };
-
-            vertex_changed = self.last_vertex_mtime.is_none_or(|last| modified > last);
-            vertex_modified = Some(modified);
-        }
-
-        if !fragment_changed && !vertex_changed {
-            return;
-        }
-
-        let fragment_raw = match std::fs::read_to_string(&fragment_path) {
-            Ok(source) => source,
-            Err(err) => {
-                eprintln!(
-                    "Watch warning: failed to read {}: {}",
-                    fragment_path.display(),
-                    err
-                );
-                return;
-            }
-        };
-        let new_fragment_source = assemble_fragment_shader(&fragment_raw);
-
-        let (new_vertex_source, new_draw_vertex_count) = if let Some(path) = &vertex_path {
-            let vertex_raw = match std::fs::read_to_string(path) {
-                Ok(source) => source,
-                Err(err) => {
-                    eprintln!("Watch warning: failed to read {}: {}", path.display(), err);
-                    return;
-                }
-            };
-            (
-                assemble_vertex_shader(&vertex_raw),
-                extract_draw_vertex_count(&vertex_raw),
-            )
-        } else {
-            (VERTEX_SHADER_SOURCE.to_owned(), DEFAULT_DRAW_VERTEX_COUNT)
-        };
-
-        let compiled = self.reload_program(
-            new_vertex_source,
-            new_fragment_source,
-            new_draw_vertex_count,
-        );
-
-        self.last_fragment_mtime = Some(fragment_modified);
-        if vertex_path.is_some() {
-            self.last_vertex_mtime = vertex_modified;
-        }
-
-        if compiled {
-            if vertex_changed {
-                if let Some(path) = vertex_path {
-                    eprintln!(
-                        "Reloaded shaders: {} + {}",
-                        path.display(),
-                        fragment_path.display()
-                    );
-                }
+        if let Some(shaders) = shaders {
+            if self.use_shaders(shaders) {
+                eprintln!("Reloaded {}", self.files.describe());
             } else {
-                eprintln!("Reloaded shader: {}", fragment_path.display());
+                eprintln!("Shader reload failed: {}", self.files.describe());
             }
-        } else if vertex_changed {
-            if let Some(path) = vertex_path {
-                eprintln!(
-                    "Shader reload failed: {} + {}",
-                    path.display(),
-                    fragment_path.display()
-                );
-            }
-        } else {
-            eprintln!("Shader reload failed: {}", fragment_path.display());
         }
     }
 
     fn render(&mut self) {
-        let gl = self.gl.as_ref().unwrap();
-        let program = self.program.unwrap();
-        let vao = self.vao.unwrap();
+        let (Some(gl), Some(program), Some(vao)) = (&self.gl, self.program, self.vao) else {
+            return;
+        };
 
         unsafe {
             gl.clear_color(0.0, 0.0, 0.0, 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
             gl.use_program(Some(program));
             gl.bind_vertex_array(Some(vao));
-
-            let elapsed = self.start_time.elapsed().as_secs_f32();
-            if let Some(ref loc) = self.u_time {
-                gl.uniform_1_f32(Some(loc), elapsed);
-            }
-            if let Some(ref loc) = self.u_resolution {
-                gl.uniform_3_f32(Some(loc), self.window_size[0], self.window_size[1], 1.0);
-            }
-            if let Some(ref loc) = self.u_mouse {
-                gl.uniform_4_f32(
-                    Some(loc),
-                    self.mouse_pos[0],
-                    self.mouse_pos[1],
-                    self.mouse_pos[2],
-                    self.mouse_pos[3],
-                );
-            }
-            if let Some(ref loc) = self.u_frame {
-                gl.uniform_1_i32(Some(loc), self.frame_count);
-            }
-
-            gl.draw_arrays(glow::TRIANGLES, 0, self.draw_vertex_count);
         }
 
-        self.gl_surface
-            .as_ref()
-            .unwrap()
-            .swap_buffers(self.gl_context.as_ref().unwrap())
-            .unwrap();
+        self.uniforms.upload(
+            gl,
+            &FrameInputs {
+                time: self.start_time.elapsed().as_secs_f32(),
+                resolution: self.window_size,
+                cursor: self.cursor_pos,
+                mouse: self.mouse_pos,
+                frame: self.frame_count,
+            },
+        );
+
+        unsafe { gl.draw_arrays(glow::TRIANGLES, 0, self.draw_vertex_count) };
+
+        if let (Some(surface), Some(context)) = (&self.gl_surface, &self.gl_context)
+            && let Err(err) = surface.swap_buffers(context)
+        {
+            eprintln!("Failed to swap buffers: {err}");
+        }
 
         self.frame_count += 1;
     }
@@ -380,12 +215,13 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Build window + GL display.
+        // Build window + GL display. The depth buffer lets custom vertex
+        // shaders draw 3D geometry.
         let window_attrs = Window::default_attributes()
             .with_title("shady")
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
 
-        let template = ConfigTemplateBuilder::new();
+        let template = ConfigTemplateBuilder::new().with_depth_size(24);
         let display_builder = DisplayBuilder::new().with_window_attributes(Some(window_attrs));
 
         let (window, gl_config) = display_builder
@@ -406,20 +242,19 @@ impl ApplicationHandler for App {
         let raw_window_handle = window.window_handle().ok().map(|h| h.as_raw());
         let gl_display = gl_config.display();
 
-        // Create GL context.
+        // Create GL context. Every shader is GLSL 3.30, so there is no point
+        // falling back to GLES.
         let context_attrs = ContextAttributesBuilder::new()
             .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
             .build(raw_window_handle);
-        let fallback_attrs = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(Some(Version::new(3, 0))))
-            .build(raw_window_handle);
 
-        let not_current = unsafe {
-            gl_display
-                .create_context(&gl_config, &context_attrs)
-                .or_else(|_| gl_display.create_context(&gl_config, &fallback_attrs))
-                .expect("Failed to create GL context")
-        };
+        let not_current = unsafe { gl_display.create_context(&gl_config, &context_attrs) }
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "Error: shady needs OpenGL 3.3, but creating a 3.3 context failed: {err}"
+                );
+                std::process::exit(1);
+            });
 
         // Create surface.
         let size = window.inner_size();
@@ -446,41 +281,25 @@ impl ApplicationHandler for App {
         let gl =
             unsafe { glow::Context::from_loader_function_cstr(|s| gl_display.get_proc_address(s)) };
 
-        // Compile shader program; if it fails, use fallback error pattern.
-        let program = match create_program(&gl, &self.vertex_source, &self.fragment_source) {
-            Ok(program) => program,
-            Err(err) => {
-                eprintln!("{}", err);
-                eprintln!("Using built-in error shader until source compiles.");
-                self.vertex_source = VERTEX_SHADER_SOURCE.to_owned();
-                self.fragment_source = error_fragment_shader_source().to_owned();
-                self.draw_vertex_count = DEFAULT_DRAW_VERTEX_COUNT;
-                create_error_program(&gl)
-            }
-        };
-
         // Create empty VAO.
         let vao = unsafe { gl.create_vertex_array().expect("Failed to create VAO") };
 
-        // Cache uniform locations.
-        let u_time = unsafe { gl.get_uniform_location(program, "u_time") };
-        let u_resolution = unsafe { gl.get_uniform_location(program, "u_resolution") };
-        let u_mouse = unsafe { gl.get_uniform_location(program, "u_mouse") };
-        let u_frame = unsafe { gl.get_uniform_location(program, "u_frame") };
+        unsafe {
+            // LEQUAL so shaders that write a depth of exactly 1.0 still draw.
+            gl.enable(glow::DEPTH_TEST);
+            gl.depth_func(glow::LEQUAL);
+        }
 
-        self.gl_config = Some(gl_config);
         self.gl_context = Some(gl_context);
         self.gl_surface = Some(surface);
         self.window = Some(window);
         self.gl = Some(gl);
-        self.program = Some(program);
         self.vao = Some(vao);
-        self.u_time = u_time;
-        self.u_resolution = u_resolution;
-        self.u_mouse = u_mouse;
-        self.u_frame = u_frame;
         self.resize_surface(size);
-        self.start_time = Instant::now();
+
+        if let Some(shaders) = self.pending_shaders.take() {
+            self.use_shaders(shaders);
+        }
     }
 
     fn window_event(
@@ -516,28 +335,28 @@ impl ApplicationHandler for App {
                     self.mouse_pos[1] = self.cursor_pos[1];
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    match state {
-                        ElementState::Pressed => {
-                            self.mouse_pressed = true;
-                            self.mouse_pos[0] = self.cursor_pos[0];
-                            self.mouse_pos[1] = self.cursor_pos[1];
-                            self.mouse_pos[2] = self.cursor_pos[0];
-                            self.mouse_pos[3] = self.cursor_pos[1];
-                        }
-                        ElementState::Released => {
-                            self.mouse_pressed = false;
-                            self.mouse_pos[2] = -self.mouse_pos[2].abs();
-                            self.mouse_pos[3] = -self.mouse_pos[3].abs();
-                        }
-                    }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    self.mouse_pressed = true;
+                    self.mouse_pos = [
+                        self.cursor_pos[0],
+                        self.cursor_pos[1],
+                        self.cursor_pos[0],
+                        self.cursor_pos[1],
+                    ];
                 }
-            }
+                ElementState::Released => {
+                    self.mouse_pressed = false;
+                    self.mouse_pos[2] = -self.mouse_pos[2].abs();
+                    self.mouse_pos[3] = -self.mouse_pos[3].abs();
+                }
+            },
             WindowEvent::RedrawRequested => {
-                if self.gl.is_some() {
-                    self.render();
-                }
+                self.render();
             }
             _ => {}
         }
