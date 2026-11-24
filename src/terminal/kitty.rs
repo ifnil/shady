@@ -1,16 +1,27 @@
 //! The parts of the kitty graphics protocol that shady uses:
 //! <https://sw.kovidgoyal.net/kitty/graphics-protocol/>
+//!
+//! Inside tmux, each command is wrapped in tmux's passthrough sequence, which
+//! tmux forwards to the terminal it runs in when `allow-passthrough` is on.
+//! tmux doesn't know about the image, so it can't keep it in place. Instead,
+//! shady prints Unicode placeholder characters that the terminal draws the
+//! image over, and tmux positions those like any other text.
 
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-/// Image id for the frames. Each frame replaces the image with this id.
-pub const IMAGE_ID: u32 = 1;
+use super::diacritics::ROW_DIACRITICS;
 
 /// Raw bytes per chunk when sending pixels through the tty. 3072 bytes encode
 /// to 4096 bytes of base64, the largest chunk the protocol allows.
 const RAW_CHUNK_SIZE: usize = 3072;
+
+/// The character the terminal replaces with a cell of an image.
+const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// The most image rows that placeholders can number.
+pub const MAX_PLACEHOLDER_ROWS: u16 = ROW_DIACRITICS.len() as u16;
 
 /// Requests the terminal's primary device attributes. Every terminal answers
 /// this, so a graphics query sent before it has been answered (or ignored)
@@ -23,14 +34,45 @@ pub enum Transport {
     Direct,
     /// Pixel data in temporary files that the terminal reads and deletes.
     /// Much faster, but only works when the terminal runs on this machine.
-    TempFile { dir: PathBuf, counter: u64 },
+    TempFile {
+        dir: PathBuf,
+        counter: u64,
+        /// The latest frame's file, until it's replaced or removed.
+        last: Option<PathBuf>,
+    },
 }
 
 impl Transport {
+    pub fn temp_files(dir: PathBuf) -> Self {
+        Transport::TempFile {
+            dir,
+            counter: 0,
+            last: None,
+        }
+    }
+
     pub fn describe(&self) -> &'static str {
         match self {
             Transport::Direct => "direct",
             Transport::TempFile { .. } => "temp files",
+        }
+    }
+
+    /// Whether the terminal has read the latest frame, which it shows by
+    /// deleting the frame's file. Always false when sending directly.
+    pub fn frame_read(&self) -> bool {
+        match self {
+            Transport::TempFile { last, .. } => last.as_ref().is_none_or(|path| !path.exists()),
+            Transport::Direct => false,
+        }
+    }
+
+    /// Removes the latest frame's file if the terminal hasn't.
+    pub fn remove_unread(&mut self) {
+        if let Transport::TempFile { last, .. } = self
+            && let Some(path) = last.take()
+        {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -54,70 +96,148 @@ pub fn temp_file_name(tag: &str) -> String {
     )
 }
 
-/// Asks whether the terminal accepts a 1x1 RGB image sent directly.
-pub fn query_direct(id: u32) -> String {
-    // "AAAA" is one black RGB pixel.
-    format!("\x1b_Gi={id},s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\")
+/// Writes graphics commands for this terminal.
+#[derive(Clone, Copy)]
+pub struct Graphics {
+    /// Whether shady runs inside tmux. See the module docs.
+    pub tmux: bool,
+    /// Id of the frame image. Ids are shared by everything in the terminal
+    /// window, including other tmux panes, so it varies by process.
+    /// Placeholders give it as a 256-color index, so it also stays out of the
+    /// 16 basic colors, which tmux may rewrite as different sequences.
+    pub image_id: u32,
 }
 
-/// Asks whether the terminal can read a 1x1 RGB image from the temp file at
-/// `path`.
-pub fn query_temp_file(id: u32, path: &Path) -> String {
-    let path = base64(path.as_os_str().as_bytes());
-    format!("\x1b_Gi={id},s=1,v=1,a=q,t=t,f=24;{path}\x1b\\")
-}
-
-/// Deletes the frame image and frees its data.
-pub fn write_delete(out: &mut impl Write) -> io::Result<()> {
-    write!(out, "\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\")
-}
-
-/// Writes one RGB frame at the cursor, replacing the previous frame and
-/// scaled to fill `cols` x `rows` cells. The cursor doesn't move. The terminal
-/// replies once it has loaded the frame.
-pub fn write_frame(
-    out: &mut impl Write,
-    transport: &mut Transport,
-    rgb: &[u8],
-    size: [u32; 2],
-    cells: [u16; 2],
-) -> io::Result<()> {
-    let [width, height] = size;
-    let [cols, rows] = cells;
-    let header = format!("a=T,f=24,s={width},v={height},i={IMAGE_ID},p=1,c={cols},r={rows},C=1");
-
-    if let Transport::TempFile { dir, counter } = transport {
-        // A new name per frame, so a file isn't rewritten while the terminal
-        // is still reading it.
-        let path = dir.join(temp_file_name(&counter.to_string()));
-        *counter += 1;
-        match std::fs::write(&path, rgb) {
-            Ok(()) => {
-                let path = base64(path.as_os_str().as_bytes());
-                return write!(out, "\x1b_G{header},t=t;{path}\x1b\\");
-            }
-            // The temp directory may be full; sending directly still works.
-            Err(_) => *transport = Transport::Direct,
+impl Graphics {
+    pub fn new(tmux: bool) -> Self {
+        Self {
+            tmux,
+            image_id: 16 + std::process::id() % 240,
         }
     }
 
-    let mut encoded = Vec::with_capacity(RAW_CHUNK_SIZE / 3 * 4);
-    let mut chunks = rgb.chunks(RAW_CHUNK_SIZE).peekable();
-    let mut first = true;
-    while let Some(chunk) = chunks.next() {
-        let more = u8::from(chunks.peek().is_some());
-        if first {
-            write!(out, "\x1b_G{header},m={more};")?;
-            first = false;
+    /// Asks whether the terminal accepts a 1x1 RGB image sent directly.
+    pub fn query_direct(&self, out: &mut impl Write, id: u32) -> io::Result<()> {
+        // "AAAA" is one black RGB pixel.
+        self.command(out, &format!("i={id},s=1,v=1,a=q,t=d,f=24"), b"AAAA")
+    }
+
+    /// Asks whether the terminal can read a 1x1 RGB image from the temp file
+    /// at `path`.
+    pub fn query_temp_file(&self, out: &mut impl Write, id: u32, path: &Path) -> io::Result<()> {
+        let path = base64(path.as_os_str().as_bytes());
+        self.command(
+            out,
+            &format!("i={id},s=1,v=1,a=q,t=t,f=24"),
+            path.as_bytes(),
+        )
+    }
+
+    /// Deletes the frame image and frees its data.
+    pub fn delete(&self, out: &mut impl Write) -> io::Result<()> {
+        self.command(out, &format!("a=d,d=I,i={},q=2", self.image_id), b"")
+    }
+
+    /// Sends one RGB frame, replacing the previous one, scaled to fill
+    /// `cells` (columns and rows).
+    ///
+    /// Outside tmux, the frame goes at the cursor, which doesn't move, and the
+    /// terminal replies once it has loaded the frame. Inside tmux, the frame
+    /// shows wherever the placeholders are, and the terminal doesn't reply:
+    /// tmux would pass the reply on as typed input to whichever pane is
+    /// active, which may not be shady's.
+    pub fn write_frame(
+        &self,
+        out: &mut impl Write,
+        transport: &mut Transport,
+        rgb: &[u8],
+        size: [u32; 2],
+        cells: [u16; 2],
+    ) -> io::Result<()> {
+        let [width, height] = size;
+        let [cols, rows] = cells;
+        let (placement, quiet) = if self.tmux {
+            ("U=1", "q=2,")
         } else {
-            write!(out, "\x1b_Gm={more};")?;
+            ("C=1", "")
+        };
+        let header = format!(
+            "a=T,f=24,s={width},v={height},i={},p=1,c={cols},r={rows},{placement},{quiet}",
+            self.image_id
+        );
+
+        if let Transport::TempFile { dir, counter, last } = transport {
+            // The terminal hasn't read the previous frame in time, or
+            // rejected it.
+            if let Some(path) = last.take() {
+                let _ = std::fs::remove_file(path);
+            }
+            // A new name per frame, so a file isn't rewritten while the
+            // terminal is still reading it.
+            let path = dir.join(temp_file_name(&counter.to_string()));
+            *counter += 1;
+            match std::fs::write(&path, rgb) {
+                Ok(()) => {
+                    let encoded = base64(path.as_os_str().as_bytes());
+                    *last = Some(path);
+                    return self.command(out, &format!("{header}t=t"), encoded.as_bytes());
+                }
+                // The temp directory may be full; sending directly still works.
+                Err(_) => *transport = Transport::Direct,
+            }
         }
-        encoded.clear();
-        base64_into(chunk, &mut encoded);
-        out.write_all(&encoded)?;
-        out.write_all(b"\x1b\\")?;
+
+        let mut encoded = Vec::with_capacity(RAW_CHUNK_SIZE / 3 * 4);
+        let mut chunks = rgb.chunks(RAW_CHUNK_SIZE).peekable();
+        let mut first = true;
+        while let Some(chunk) = chunks.next() {
+            let more = u8::from(chunks.peek().is_some());
+            // Later chunks only repeat `q`, so the reply stays suppressed.
+            let control = if first {
+                format!("{header}m={more}")
+            } else {
+                format!("{quiet}m={more}")
+            };
+            first = false;
+            encoded.clear();
+            base64_into(chunk, &mut encoded);
+            self.command(out, &control, &encoded)?;
+        }
+        Ok(())
     }
-    Ok(())
+
+    /// Prints the placeholders that show the frame inside tmux, starting at
+    /// the top left: `cells` (columns and rows) of placeholder characters in
+    /// the image id's color. Only the first cell of each row carries the
+    /// row's diacritic; the terminal numbers the rest of the row from it.
+    /// Draws at most `MAX_PLACEHOLDER_ROWS` rows.
+    pub fn write_placeholders(&self, out: &mut impl Write, cells: [u16; 2]) -> io::Result<()> {
+        let [cols, rows] = cells;
+        let rest: String =
+            std::iter::repeat_n(PLACEHOLDER, usize::from(cols.saturating_sub(1))).collect();
+        write!(out, "\x1b[38;5;{}m", self.image_id)?;
+        for (row, diacritic) in ROW_DIACRITICS.iter().take(usize::from(rows)).enumerate() {
+            write!(out, "\x1b[{};1H{PLACEHOLDER}{diacritic}{rest}", row + 1)?;
+        }
+        out.write_all(b"\x1b[39m")
+    }
+
+    /// Writes one graphics command. Inside tmux it's wrapped in a
+    /// passthrough sequence, in which its own escape characters are doubled.
+    fn command(&self, out: &mut impl Write, control: &str, payload: &[u8]) -> io::Result<()> {
+        let (start, end): (&[u8], &[u8]) = if self.tmux {
+            (b"\x1bPtmux;\x1b\x1b_G", b"\x1b\x1b\\\x1b\\")
+        } else {
+            (b"\x1b_G", b"\x1b\\")
+        };
+        out.write_all(start)?;
+        out.write_all(control.as_bytes())?;
+        if !payload.is_empty() {
+            out.write_all(b";")?;
+            out.write_all(payload)?;
+        }
+        out.write_all(end)
+    }
 }
 
 pub fn base64(data: &[u8]) -> String {
@@ -259,11 +379,22 @@ mod tests {
         assert_eq!(base64(&[0, 0, 0]), "AAAA");
     }
 
+    const PLAIN: Graphics = Graphics {
+        tmux: false,
+        image_id: 1,
+    };
+    const TMUX: Graphics = Graphics {
+        tmux: true,
+        image_id: 42,
+    };
+
     #[test]
     fn splits_direct_frames_into_chunks() {
         let rgb = vec![7u8; RAW_CHUNK_SIZE * 2 + 3];
         let mut out = Vec::new();
-        write_frame(&mut out, &mut Transport::Direct, &rgb, [1, 2], [3, 4]).unwrap();
+        PLAIN
+            .write_frame(&mut out, &mut Transport::Direct, &rgb, [1, 2], [3, 4])
+            .unwrap();
         let out = String::from_utf8(out).unwrap();
 
         let commands: Vec<_> = out.split_terminator("\x1b\\").collect();
@@ -274,6 +405,47 @@ mod tests {
         let payload_len = |c: &str| c.split_once(';').unwrap().1.len();
         assert_eq!(payload_len(commands[0]), 4096);
         assert_eq!(payload_len(commands[2]), 4);
+    }
+
+    #[test]
+    fn wraps_quiet_commands_for_tmux() {
+        let rgb = vec![7u8; RAW_CHUNK_SIZE + 3];
+        let mut out = Vec::new();
+        TMUX.write_frame(&mut out, &mut Transport::Direct, &rgb, [1, 2], [3, 4])
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+
+        // Each command is in its own passthrough sequence, with its escape
+        // characters doubled.
+        let (before, wrapped) = out.split_once("\x1bPtmux;").unwrap();
+        assert_eq!(before, "");
+        let commands: Vec<_> = wrapped
+            .split("\x1bPtmux;")
+            .map(|command| command.strip_suffix("\x1b\\").unwrap())
+            .map(|command| command.replace("\x1b\x1b", "\x1b"))
+            .collect();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[0].starts_with("\x1b_Ga=T,f=24,s=1,v=2,i=42,p=1,c=3,r=4,U=1,q=2,m=1;"));
+        assert!(commands[1].starts_with("\x1b_Gq=2,m=0;"));
+        for command in &commands {
+            assert!(command.ends_with("\x1b\\"));
+            assert_eq!(command.matches('\x1b').count(), 2);
+        }
+    }
+
+    #[test]
+    fn prints_placeholders() {
+        let mut out = Vec::new();
+        TMUX.write_placeholders(&mut out, [3, 2]).unwrap();
+        // The 2 rows by 3 columns example from kitty's docs, with each row
+        // positioned.
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "\x1b[38;5;42m\
+             \x1b[1;1H\u{10EEEE}\u{0305}\u{10EEEE}\u{10EEEE}\
+             \x1b[2;1H\u{10EEEE}\u{030D}\u{10EEEE}\u{10EEEE}\
+             \x1b[39m"
+        );
     }
 
     #[test]
