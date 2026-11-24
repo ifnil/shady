@@ -7,6 +7,7 @@ Usage: shady [options] <fragment.glsl>
 Options:
   -w, --watch            Reload the shaders when their files change
   -v, --vertex <file>    Use a custom vertex shader
+  -k, --kitty            Draw in this terminal with the kitty graphics protocol
   -h, --help             Show this help";
 
 #[derive(Debug)]
@@ -14,6 +15,7 @@ pub struct CliOptions {
     pub fragment_path: PathBuf,
     pub vertex_path: Option<PathBuf>,
     pub watch_enabled: bool,
+    pub kitty: bool,
 }
 
 #[derive(Debug)]
@@ -32,6 +34,7 @@ fn invalid(message: impl Into<String>) -> CliError {
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CliOptions, CliError> {
     let mut watch_enabled = false;
+    let mut kitty = false;
     let mut vertex_path: Option<PathBuf> = None;
     let mut fragment_path: Option<PathBuf> = None;
     let mut only_paths = false;
@@ -50,6 +53,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CliOptions, CliErro
             Some("--") => only_paths = true,
             Some("-h" | "--help") => return Err(CliError::Help),
             Some("-w" | "--watch") => watch_enabled = true,
+            Some("-k" | "--kitty") => kitty = true,
             Some(flag @ ("-v" | "--vertex")) => {
                 let Some(path) = args.next() else {
                     return Err(invalid(format!("missing file after {flag}")));
@@ -68,6 +72,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<CliOptions, CliErro
         fragment_path,
         vertex_path,
         watch_enabled,
+        kitty,
     })
 }
 
@@ -81,8 +86,9 @@ mod tests {
 
     #[test]
     fn parses_flags_and_paths() {
-        let options = parse_strs(&["-w", "--vertex", "a.vert", "b.frag"]).unwrap();
+        let options = parse_strs(&["-w", "--vertex", "a.vert", "b.frag", "-k"]).unwrap();
         assert!(options.watch_enabled);
+        assert!(options.kitty);
         assert_eq!(options.vertex_path, Some(PathBuf::from("a.vert")));
         assert_eq!(options.fragment_path, PathBuf::from("b.frag"));
     }

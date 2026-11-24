@@ -42,6 +42,8 @@ pub struct ShaderSet {
     pub vertex: String,
     pub fragment: String,
     pub draw_vertex_count: i32,
+    /// Problems that don't stop the shaders from compiling.
+    pub warnings: Vec<String>,
 }
 
 impl ShaderSet {
@@ -55,9 +57,11 @@ impl ShaderSet {
                 vertex: VERTEX_SHADER_SOURCE.to_owned(),
                 fragment: assemble_stage(fragment, &fragment_info, None, Stage::Fragment),
                 draw_vertex_count: DEFAULT_DRAW_VERTEX_COUNT,
+                warnings: Vec::new(),
             };
         };
 
+        let mut warnings = Vec::new();
         let vertex_info = SourceInfo::scan(vertex);
         Self {
             vertex: assemble_stage(vertex, &vertex_info, Some(&fragment_info), Stage::Vertex),
@@ -67,7 +71,8 @@ impl ShaderSet {
                 Some(&vertex_info),
                 Stage::Fragment,
             ),
-            draw_vertex_count: extract_draw_vertex_count(vertex),
+            draw_vertex_count: extract_draw_vertex_count(vertex, &mut warnings),
+            warnings,
         }
     }
 }
@@ -291,7 +296,7 @@ fn assemble_stage(
 }
 
 /// Reads the vertex count from a `// shady:draw_vertices=N` comment.
-fn extract_draw_vertex_count(source: &str) -> i32 {
+fn extract_draw_vertex_count(source: &str, warnings: &mut Vec<String>) -> i32 {
     for line in source.lines() {
         let Some(comment) = line.trim().strip_prefix("//") else {
             continue;
@@ -305,10 +310,10 @@ fn extract_draw_vertex_count(source: &str) -> i32 {
         };
         match value.trim().parse::<i32>() {
             Ok(count) if count > 0 => return count,
-            _ => eprintln!(
-                "Warning: ignoring `{}`: the vertex count must be a positive integer",
+            _ => warnings.push(format!(
+                "ignoring `{}`: the vertex count must be a positive integer",
                 line.trim()
-            ),
+            )),
         }
     }
 
@@ -519,9 +524,24 @@ mod tests {
 
     #[test]
     fn parses_draw_vertex_count() {
-        assert_eq!(extract_draw_vertex_count("// shady:draw_vertices=36\n"), 36);
-        assert_eq!(extract_draw_vertex_count("//shady:draw-vertices= 6\n"), 6);
-        assert_eq!(extract_draw_vertex_count("// shady:draw_vertices=abc\n"), 3);
-        assert_eq!(extract_draw_vertex_count("void main() {}\n"), 3);
+        let mut warnings = Vec::new();
+        assert_eq!(
+            extract_draw_vertex_count("// shady:draw_vertices=36\n", &mut warnings),
+            36
+        );
+        assert_eq!(
+            extract_draw_vertex_count("//shady:draw-vertices= 6\n", &mut warnings),
+            6
+        );
+        assert_eq!(
+            extract_draw_vertex_count("void main() {}\n", &mut warnings),
+            3
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(
+            extract_draw_vertex_count("// shady:draw_vertices=abc\n", &mut warnings),
+            3
+        );
+        assert_eq!(warnings.len(), 1);
     }
 }

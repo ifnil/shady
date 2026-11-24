@@ -1,7 +1,10 @@
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::shader::ShaderSet;
+
+/// How often watch mode checks the shader files for changes.
+const WATCH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// The shader files on disk, and their modification times as of the last load.
 pub struct ShaderFiles {
@@ -81,6 +84,53 @@ impl ShaderFiles {
         match &self.vertex {
             Some(vertex) => format!("{} + {}", vertex.path.display(), fragment),
             None => fragment.to_string(),
+        }
+    }
+}
+
+/// Reloads the shader files when they change, checking at most every
+/// `WATCH_INTERVAL`.
+pub struct Watcher {
+    files: ShaderFiles,
+    last_check: Instant,
+    /// The last problem returned, so a lasting one is reported once.
+    last_error: Option<String>,
+}
+
+impl Watcher {
+    pub fn new(files: ShaderFiles) -> Self {
+        Self {
+            files,
+            last_check: Instant::now(),
+            last_error: None,
+        }
+    }
+
+    /// Returns the reloaded shaders after a file changed, or an error the
+    /// first time a problem appears. Editors that save by replacing the file
+    /// can leave it missing for a moment, so the same error isn't repeated.
+    pub fn poll(&mut self) -> Option<Result<ShaderSet, String>> {
+        if self.last_check.elapsed() < WATCH_INTERVAL {
+            return None;
+        }
+        self.last_check = Instant::now();
+
+        let loaded = match self.files.changed() {
+            Ok(true) => self.files.load().map(Some),
+            Ok(false) => Ok(None),
+            Err(err) => Err(err),
+        };
+
+        match loaded {
+            Ok(shaders) => {
+                self.last_error = None;
+                shaders.map(Ok)
+            }
+            Err(err) if self.last_error.as_ref() == Some(&err) => None,
+            Err(err) => {
+                self.last_error = Some(err.clone());
+                Some(Err(err))
+            }
         }
     }
 }

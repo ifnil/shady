@@ -83,7 +83,11 @@ pub struct Uniforms {
 impl Uniforms {
     /// Finds the built-in uniforms a linked program uses. A uniform declared
     /// with a type the runtime can't set is reported and left unset.
-    pub fn query(gl: &glow::Context, program: glow::NativeProgram) -> Self {
+    pub fn query(
+        gl: &glow::Context,
+        program: glow::NativeProgram,
+        warnings: &mut Vec<String>,
+    ) -> Self {
         let mut bindings = Vec::new();
 
         for index in 0..unsafe { gl.get_active_uniforms(program) } {
@@ -101,12 +105,12 @@ impl Uniforms {
                     declared = format!("{declared}[{}]", active.size);
                 }
                 let expected: Vec<_> = accepted.iter().map(|&t| type_name(t)).collect();
-                eprintln!(
-                    "Warning: {} is declared as {}, but shady can only set it as {}; it will stay zero.",
+                warnings.push(format!(
+                    "{} is declared as {}, but shady can only set it as {}; it will stay zero",
                     builtin.name(),
                     declared,
                     expected.join(" or ")
-                );
+                ));
                 continue;
             }
 
